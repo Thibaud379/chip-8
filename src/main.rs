@@ -1,21 +1,27 @@
 mod chip_8;
 
-use std::{
-    fs::File,
-    io::{BufReader, Read},
-};
-
 use chip_8::*;
 fn main() -> std::io::Result<()> {
-    // let mut vm = Chip8VM::new(None, None, Some(Chip8VMOptions { debug_ram: true }));
-    let mut vm = Chip8VM::new(None, None, None);
-    let f = File::open("ibm.ch8")?;
-    let mut reader = BufReader::new(f);
-    let mut buf: Vec<u8> = Vec::new();
+    // let mut vm = Chip8VM::new(
+    //     Some(10),
+    //     None,
+    //     Some(Chip8VMOptions {
+    //         debug: true,
+    //         // hide_display: trcue,
+    //         keep_display: true,
+    //         new_jump_off: true,
+    //         ..Default::default()
+    //     }),
+    // );
+    let mut vm = Chip8VM::new(
+        Some(100),
+        None,
+        Some(Chip8VMOptions {
+            ..Default::default()
+        }),
+    );
 
-    reader.read_to_end(&mut buf)?;
-
-    vm.load_rom(&buf);
+    vm.load_rom_from_file("KALEID.ch8");
     // println!("{:?}", vm);
 
     vm.run();
