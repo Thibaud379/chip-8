@@ -1,5 +1,3 @@
-mod chip_8;
-
 use chip_8::*;
 fn main() -> std::io::Result<()> {
     // let mut vm = Chip8VM::new(
@@ -14,15 +12,17 @@ fn main() -> std::io::Result<()> {
     //     }),
     // );
     let mut vm = Chip8VM::new(
-        Some(100),
+        Some(12),
         None,
         Some(Chip8VMOptions {
+            keep_display: true,
+            hide_display: true,
             ..Default::default()
         }),
     );
 
-    vm.load_rom_from_file("KALEID.ch8");
-    // println!("{:?}", vm);
+    vm.load_rom_from_file("ibm.ch8");
+    println!("{:?}", vm);
 
     vm.run();
 

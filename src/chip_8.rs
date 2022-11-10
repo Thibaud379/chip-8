@@ -1,44 +1,13 @@
 use std::fmt::Debug;
 use std::io::Read;
-use std::{thread::sleep, time::Duration};
+use std::sync::{Arc, Condvar, Mutex};
+use std::{thread, time::Duration, time::Instant};
 
-const FONT_SIZE: usize = 80;
-type Font = [u8; FONT_SIZE];
-
-const FONT_START: usize = 0x50;
-const FONT: [u8; FONT_SIZE] = [
-    0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
-    0x20, 0x60, 0x20, 0x20, 0x70, // 1
-    0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
-    0xF0, 0x10, 0xF0, 0x10, 0xF0, // 3
-    0x90, 0x90, 0xF0, 0x10, 0x10, // 4
-    0xF0, 0x80, 0xF0, 0x10, 0xF0, // 5
-    0xF0, 0x80, 0xF0, 0x90, 0xF0, // 6
-    0xF0, 0x10, 0x20, 0x40, 0x40, // 7
-    0xF0, 0x90, 0xF0, 0x90, 0xF0, // 8
-    0xF0, 0x90, 0xF0, 0x10, 0xF0, // 9
-    0xF0, 0x90, 0xF0, 0x90, 0x90, // A
-    0xE0, 0x90, 0xE0, 0x90, 0xE0, // B
-    0xF0, 0x80, 0x80, 0x80, 0xF0, // C
-    0xE0, 0x90, 0x90, 0x90, 0xE0, // D
-    0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
-    0xF0, 0x80, 0xF0, 0x80, 0x80, // F
-];
-
-const FREQ: u32 = 700;
-
-const TIMER_FREQ: u32 = 60;
-
-const RAM_SIZE: usize = 4096;
-type Ram = [u8; RAM_SIZE];
-
-const RAM_ROM_START: usize = 0x200;
-
-const DISPLAY_WIDTH: usize = 64;
-const DISPLAY_HEIGHT: usize = 32;
-type Display = [[bool; DISPLAY_WIDTH]; DISPLAY_HEIGHT];
-
-const DISPLAY_EMPTY: Display = [[false; DISPLAY_WIDTH]; DISPLAY_HEIGHT];
+type Ram = [u8; Chip8VM::RAM_SIZE];
+type Font = [u8; Chip8VM::FONT_SIZE];
+type Display = [[bool; Chip8VM::DISPLAY_WIDTH]; Chip8VM::DISPLAY_HEIGHT];
+type U4 = u8;
+type U12 = u16;
 
 #[derive(Default)]
 struct Registers {
@@ -113,10 +82,9 @@ impl Registers {
         }
     }
 }
-
 impl std::fmt::Debug for Registers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "---  Registers ---")?;
+        writeln!(f, "---  Registers  ---")?;
         write!(f, " pc|")?;
         writeln!(f, "  i|")?;
         write!(f, "{:>3x}|", self.pc)?;
@@ -149,9 +117,64 @@ struct Timers {
     delay: u8,
     buzzer: u8,
 }
+impl Timers {
+    const TIMER_FREQ: u32 = 60;
 
-type U4 = u8;
-type U12 = u16;
+    fn update(&mut self) {
+        self.delay = self.delay.saturating_sub(1);
+        self.buzzer = self.buzzer.saturating_sub(1);
+    }
+}
+
+struct TimersWrapper {
+    timers: Arc<Mutex<Timers>>,
+    lock: Arc<(Mutex<bool>, Condvar)>,
+}
+impl Debug for TimersWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "---  Timers  ---")?;
+        let t = self.timers.lock().unwrap();
+        writeln!(f, "delay: {} | buzzer: {}", t.delay, t.buzzer)
+    }
+}
+impl TimersWrapper {
+    fn new() -> Self {
+        let wrapper = TimersWrapper {
+            timers: Arc::new(Mutex::new(Timers {
+                delay: 120,
+                buzzer: 0,
+            })),
+            lock: Arc::new((Mutex::new(false), Condvar::new())),
+        };
+        let t_clone = Arc::clone(&wrapper.timers);
+        let l_clone = Arc::clone(&wrapper.lock);
+        thread::spawn(move || {
+            let timer = t_clone;
+            let (lock, cvar) = &*l_clone;
+            let mut last_update = Instant::now();
+            let mut wait: f64;
+            loop {
+                //wait for start signal
+                let mut started = lock.lock().unwrap();
+                // As long as the value inside the `Mutex<bool>` is `false`, we wait.
+                while !*started {
+                    println!("Timers waiting to start");
+                    started = cvar.wait(started).unwrap();
+                    println!("Timers starting");
+                }
+
+                wait =
+                    (1. / Timers::TIMER_FREQ as f64 - last_update.elapsed().as_secs_f64()).max(0.);
+
+                thread::sleep(Duration::from_secs_f64(wait));
+                timer.lock().unwrap().update();
+                last_update = Instant::now();
+            }
+        });
+        wrapper
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum Chip8Instr {
     Clear,
@@ -185,7 +208,6 @@ enum Chip8Instr {
     Load(U4),
     Unknown,
 }
-
 impl From<u16> for Chip8Instr {
     fn from(input: u16) -> Self {
         let x = (input >> 8 & 0xF) as U4;
@@ -247,30 +269,26 @@ pub struct Chip8VM {
     ram: Ram,
 
     // Display of 64*32 pixels (On or Off)
-    display: Display,
+    pub display: Display,
 
     //All registers
     registers: Registers,
 
     //Timers
-    timers: Timers,
+    timers: TimersWrapper,
 
     //Stack
     stack: Vec<U12>,
 
     //Clock speed (Hz)
-    freq: u32,
+    pub freq: u32,
 
     //Misc options
     options: Chip8VMOptions,
 }
-
-const LINE_WIDTH: usize = 32;
-const LINES: usize = RAM_SIZE / LINE_WIDTH;
-
 impl std::fmt::Debug for Chip8VM {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // writeln!(f, "{:?}", self.timers)?;
+        writeln!(f, "{:?}", self.timers)?;
         writeln!(f, "{:?}", self.registers)?;
         // writeln!(f, "--- Stack ---\n{:?}", self.stack)?;
         let r = writeln!(
@@ -280,53 +298,89 @@ impl std::fmt::Debug for Chip8VM {
         );
         if self.options.debug_ram {
             writeln!(f, "--- RAM dump ---")?;
-            for i in 0..LINES - 1 {
+            for i in 0..Self::RAM_DISP_LINES - 1 {
                 writeln!(
                     f,
                     "{:>2x?}",
-                    &self.ram[i * LINE_WIDTH..(i + 1) * LINE_WIDTH]
+                    &self.ram[i * Self::RAM_DISP_LINE_WIDTH..(i + 1) * Self::RAM_DISP_LINE_WIDTH]
                 )?;
             }
-            write!(f, "{:>2x?}", &self.ram[(LINES - 1) * LINE_WIDTH..])
+            write!(
+                f,
+                "{:>2x?}",
+                &self.ram[(Self::RAM_DISP_LINES - 1) * Self::RAM_DISP_LINE_WIDTH..]
+            )
         } else {
             r
         }
     }
 }
-
 impl std::fmt::Display for Chip8VM {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{:#?}", self.display)
     }
 }
-
 impl Chip8VM {
+    const RAM_DISP_LINE_WIDTH: usize = 32;
+    const RAM_DISP_LINES: usize = Self::RAM_SIZE / Self::RAM_DISP_LINE_WIDTH;
+
+    const FREQ: u32 = 700;
+
+    const RAM_SIZE: usize = 4096;
+
+    const RAM_ROM_START: usize = 0x200;
+
+    const FONT_SIZE: usize = 80;
+
+    const FONT_START: usize = 0x50;
+    const FONT: [u8; Self::FONT_SIZE] = [
+        0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
+        0x20, 0x60, 0x20, 0x20, 0x70, // 1
+        0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
+        0xF0, 0x10, 0xF0, 0x10, 0xF0, // 3
+        0x90, 0x90, 0xF0, 0x10, 0x10, // 4
+        0xF0, 0x80, 0xF0, 0x10, 0xF0, // 5
+        0xF0, 0x80, 0xF0, 0x90, 0xF0, // 6
+        0xF0, 0x10, 0x20, 0x40, 0x40, // 7
+        0xF0, 0x90, 0xF0, 0x90, 0xF0, // 8
+        0xF0, 0x90, 0xF0, 0x10, 0xF0, // 9
+        0xF0, 0x90, 0xF0, 0x90, 0x90, // A
+        0xE0, 0x90, 0xE0, 0x90, 0xE0, // B
+        0xF0, 0x80, 0x80, 0x80, 0xF0, // C
+        0xE0, 0x90, 0x90, 0x90, 0xE0, // D
+        0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
+        0xF0, 0x80, 0xF0, 0x80, 0x80, // F
+    ];
+
+    const DISPLAY_WIDTH: usize = 64;
+    const DISPLAY_HEIGHT: usize = 32;
+    const DISPLAY_EMPTY: Display = [[false; Self::DISPLAY_WIDTH]; Self::DISPLAY_HEIGHT];
+
     pub fn new(freq: Option<u32>, font: Option<Font>, options: Option<Chip8VMOptions>) -> Self {
         Chip8VM {
-            ram: Chip8VM::init_ram(font.unwrap_or(FONT)),
-            display: DISPLAY_EMPTY,
+            ram: Chip8VM::init_ram(font.unwrap_or(Self::FONT)),
+            display: Self::DISPLAY_EMPTY,
             registers: Registers {
-                pc: U12::try_from(RAM_ROM_START).expect("RAM_ROM_START is small enough"),
+                pc: U12::try_from(Self::RAM_ROM_START).expect("RAM_ROM_START is small enough"),
                 ..Registers::default()
             },
-            timers: Timers::default(),
+            timers: TimersWrapper::new(),
             stack: Vec::new(),
-            freq: freq.unwrap_or(FREQ),
+            freq: freq.unwrap_or(Self::FREQ),
             options: options.unwrap_or_default(),
         }
     }
 
     pub fn load_rom(&mut self, rom: &[u8]) {
         assert!(
-            rom.len() <= RAM_SIZE - RAM_ROM_START,
+            rom.len() <= Self::RAM_SIZE - Self::RAM_ROM_START,
             "Rom to big: {}B for {}B available",
             rom.len(),
-            RAM_SIZE - RAM_ROM_START
+            Self::RAM_SIZE - Self::RAM_ROM_START
         );
         self.debugln(&format!("Loaded rom of size {}B", rom.len()));
-        for index in RAM_ROM_START..RAM_ROM_START + rom.len() {
-            self.ram[index] = rom[index - RAM_ROM_START];
-        }
+        self.ram[Self::RAM_ROM_START..(Self::RAM_ROM_START + rom.len())]
+            .copy_from_slice(&rom[..(Self::RAM_ROM_START + rom.len() - Self::RAM_ROM_START)]);
     }
 
     pub fn load_rom_from_file(&mut self, rom: &str) {
@@ -339,8 +393,27 @@ impl Chip8VM {
 
         self.load_rom(&rom);
     }
+    pub fn pre_run(&mut self) {
+        let (lock, cvar) = &*self.timers.lock;
+        let mut started = lock.lock().unwrap();
+        *started = true;
+        // We notify the condvar that the value has changed.
+        cvar.notify_one();
+    }
+    pub fn run_once(&mut self) {
+        let instruction = self.fetch_instruction();
+        self.debug(&format!("input (raw,decoded): {instruction:x},"));
+
+        let instruction = Chip8Instr::from(instruction);
+        self.debugln(&format!("{instruction:?}"));
+        self.incr_pc();
+        self.execute(instruction);
+        self.debugln(&format!("{self:?}"));
+    }
     pub fn run(&mut self) {
+        self.pre_run();
         loop {
+            let time_start = Instant::now();
             let instruction = self.fetch_instruction();
             self.debug(&format!("input (raw,decoded): {instruction:x},"));
 
@@ -349,14 +422,16 @@ impl Chip8VM {
             self.incr_pc();
             self.execute(instruction);
             self.debugln(&format!("{self:?}"));
-            sleep(Duration::from_secs_f64(1. / self.freq as f64));
+            thread::sleep(Duration::from_secs_f64(
+                (1. / self.freq as f64 - time_start.elapsed().as_secs_f64()).max(0.),
+            ));
         }
     }
 
     fn execute(&mut self, instruction: Chip8Instr) {
         match instruction {
             Chip8Instr::Clear => {
-                self.display = DISPLAY_EMPTY;
+                self.display = Self::DISPLAY_EMPTY;
                 if !self.options.hide_display {
                     self.display();
                 }
@@ -444,8 +519,8 @@ impl Chip8VM {
                 self.registers.set(x, nn & rand)
             }
             Chip8Instr::Display(vx, vy, n) => {
-                let x = self.registers.get(vx) % (DISPLAY_WIDTH as u8);
-                let y = self.registers.get(vy) % (DISPLAY_HEIGHT as u8);
+                let x = self.registers.get(vx) % (Self::DISPLAY_WIDTH as u8);
+                let y = self.registers.get(vy) % (Self::DISPLAY_HEIGHT as u8);
                 let sprite_addr = self.registers.i;
                 let sprite_height = n;
                 self.draw_sprite(x, y, sprite_addr, sprite_height);
@@ -461,7 +536,8 @@ impl Chip8VM {
             }
             Chip8Instr::GetDelay(x) => {
                 println!("Delay");
-                self.registers.set(x, self.timers.delay);
+                self.registers
+                    .set(x, self.timers.timers.lock().unwrap().delay);
             }
             Chip8Instr::GetKey(x) => {
                 let mut buf = String::new();
@@ -471,17 +547,21 @@ impl Chip8VM {
                 let key = buf.chars().next().expect("input");
 
                 let key = match key {
-                    k if k >= '0' && k <= '9' => k as u8 - 48,
-                    k if k >= 'a' && k <= 'f' => k as u8 - 'a' as u8 + 10,
-                    k if k >= 'A' && k <= 'F' => k as u8 - 'A' as u8 + 10,
+                    k if k.is_ascii_digit() => k as u8 - b'0',
+                    k if k.is_ascii_lowercase() => k as u8 - b'a' + 10,
+                    k if k.is_ascii_uppercase() => k as u8 - b'A' + 10,
                     _ => 16,
                 };
                 if key < 16 {
                     self.registers.set(x, key & 0xF);
                 }
             }
-            Chip8Instr::SetDelay(x) => self.timers.delay = self.registers.get(x),
-            Chip8Instr::SetBuzzer(x) => self.timers.buzzer = self.registers.get(x),
+            Chip8Instr::SetDelay(x) => {
+                self.timers.timers.lock().unwrap().delay = self.registers.get(x)
+            }
+            Chip8Instr::SetBuzzer(x) => {
+                self.timers.timers.lock().unwrap().buzzer = self.registers.get(x)
+            }
             Chip8Instr::IncrI(x) => self.registers.i += self.registers.get(x) as u16,
             Chip8Instr::Char(x) => self.registers.i = self.char_index(self.registers.get(x)),
             Chip8Instr::Decimal(x) => {
@@ -514,17 +594,16 @@ impl Chip8VM {
     fn fetch_instruction(&self) -> u16 {
         let first_byte = self.ram[self.registers.pc as usize];
         let second_byte = self.ram[(self.registers.pc + 1) as usize];
-        let both_bytes = u16::from_be_bytes([first_byte, second_byte]);
-        both_bytes
+        u16::from_be_bytes([first_byte, second_byte])
     }
 
     fn display(&self) {
-        sleep(Duration::from_secs_f64(1f64 / 60 as f64));
+        thread::sleep(Duration::from_secs_f64(1_f64 / 60_f64));
         if !self.options.keep_display {
             print!("{esc}c", esc = 27 as char);
         }
-        for y in 0..DISPLAY_HEIGHT {
-            for x in 0..DISPLAY_WIDTH {
+        for y in 0..Self::DISPLAY_HEIGHT {
+            for x in 0..Self::DISPLAY_WIDTH {
                 if self.display[y][x] {
                     print!("⬜");
                 } else {
@@ -539,15 +618,15 @@ impl Chip8VM {
         let sprite_data =
             &self.ram[sprite_addr as usize..(sprite_addr + sprite_height as u16) as usize];
         for curr_y in y..y + sprite_height {
-            if curr_y >= DISPLAY_HEIGHT as u8 {
+            if curr_y >= Self::DISPLAY_HEIGHT as u8 {
                 break;
             }
             for curr_x in x..x + 8 {
-                if curr_x >= DISPLAY_WIDTH as u8 {
+                if curr_x >= Self::DISPLAY_WIDTH as u8 {
                     break;
                 }
                 let pixel_x = x as usize + 8 - (curr_x as usize - x as usize);
-                if pixel_x >= DISPLAY_WIDTH {
+                if pixel_x >= Self::DISPLAY_WIDTH {
                     break;
                 }
                 let pixel = &mut self.display[curr_y as usize][pixel_x];
@@ -563,16 +642,15 @@ impl Chip8VM {
     }
 
     fn char_index(&self, c: u8) -> U12 {
-        FONT_START as U12 + 5 * (c & 0xF) as U12
+        Self::FONT_START as U12 + 5 * (c & 0xF) as U12
     }
     fn incr_pc(&mut self) {
         self.registers.pc += 2;
     }
     fn init_ram(font: Font) -> Ram {
-        let mut ram = [0; RAM_SIZE];
-        for index in FONT_START..FONT_START + FONT_SIZE {
-            ram[index] = font[index - FONT_START];
-        }
+        let mut ram = [0; Self::RAM_SIZE];
+        ram[Self::FONT_START..(Self::FONT_START + Self::FONT_SIZE)]
+            .copy_from_slice(&font[..(Self::FONT_START + Self::FONT_SIZE - Self::FONT_START)]);
         ram
     }
 
@@ -594,7 +672,10 @@ mod tests {
     #[test]
     fn default_new() {
         let vm = Chip8VM::new(None, None, None);
-        assert_eq!(vm.ram[FONT_START..FONT_START + FONT_SIZE], FONT);
+        assert_eq!(
+            vm.ram[Chip8VM::FONT_START..Chip8VM::FONT_START + Chip8VM::FONT_SIZE],
+            Chip8VM::FONT
+        );
         assert_eq!(vm.freq, 700);
     }
 
